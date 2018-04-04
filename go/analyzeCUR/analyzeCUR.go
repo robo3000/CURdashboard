@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -16,11 +17,13 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/andyfase/CURDashboard/go/curconvert"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/aws/aws-sdk-go/service/athena"
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/jcxplorer/cwlogger"
 )
 
@@ -119,7 +122,7 @@ func getInstanceMetadata(sess *session.Session) map[string]interface{} {
 /*
 Function reads in and validates command line parameters
 */
-func getParams(configFile *string, sourceBucket *string, destBucket *string, account *string, curReportName *string, curReportPath *string, curDestPath *string) error {
+func getParams(configFile *string, sourceBucket *string, destBucket *string, account *string, curReportName *string, curReportPath *string, curDestPath *string, dateOverride *string) error {
 
 	// Define input command line config parameter and parse it
 	flag.StringVar(configFile, "config", defaultConfigPath, "Input config file for analyzeDBR")
@@ -129,6 +132,7 @@ func getParams(configFile *string, sourceBucket *string, destBucket *string, acc
 	flag.StringVar(curReportName, "reportname", "", "CUR Report Name")
 	flag.StringVar(curReportPath, "reportpath", "", "CUR Report PAth")
 	flag.StringVar(curDestPath, "destpath", "", "Destination Path for converted CUR to be uploaded too")
+	flag.StringVar(dateOverride, "date", "", "Optional date flag to over-ride the processing CUR month")
 
 	flag.Parse()
 
@@ -239,27 +243,30 @@ func sendQuery(svc *athena.Athena, db string, sql string, account string, region
 	ip.SetQueryExecutionId(*result.QueryExecutionId)
 
 	// loop through results (paginated call)
+	var colNames []string
 	err = svc.GetQueryResultsPages(&ip,
 		func(page *athena.GetQueryResultsOutput, lastPage bool) bool {
-			i := 0
-			var colNames []string
 			for row := range page.ResultSet.Rows {
-				if i < 1 { // first row contains column names - which we use in any subsequent rows to produce map[columnname]values
+				if len(colNames) < 1 { // first row contains column names - which we use in any subsequent rows to produce map[columnname]values
 					for j := range page.ResultSet.Rows[row].Data {
 						colNames = append(colNames, *page.ResultSet.Rows[row].Data[j].VarCharValue)
 					}
 				} else {
 					result := make(map[string]string)
+					skip := false
 					for j := range page.ResultSet.Rows[row].Data {
-						if j < len(colNames)  {
+						if j < len(colNames) {
+							if page.ResultSet.Rows[row].Data[j].VarCharValue == nil {
+								skip = true
+								break
+							}
 							result[colNames[j]] = *page.ResultSet.Rows[row].Data[j].VarCharValue
 						}
 					}
-					if len(result) > 0 {
+					if len(result) > 0 && !skip {
 						results.Rows = append(results.Rows, result)
 					}
 				}
-				i++
 			}
 			if lastPage {
 				return false // return false to end paginated calls
@@ -578,36 +585,75 @@ func riUtilization(sess *session.Session, svcAthena *athena.Athena, conf Config,
 	return nil
 }
 
-func processCUR(sourceBucket string, reportName string, reportPath string, destPath string, destBucket string) ([]curconvert.CurColumn, string, error) {
+func processCUR(sourceBucket string, reportName string, reportPath string, destPath string, destBucket string, logger *cwlogger.Logger, dateOverride string) ([]curconvert.CurColumn, string, string, error) {
 
-	// Generate CUR Date Format which is YYYYMM01-YYYYMM01
-	start := time.Now()
-	end := start.AddDate(0, 1, 0)
-	curDate := start.Format("200601") + "01-" + end.Format("200601") + "01"
+	var t1 time.Time
+	var err error
+	if len(dateOverride) == 8 {
+		t1, err = time.Parse("20060102", dateOverride)
+		if err != nil {
+			return nil, "", "", errors.New("Could not parse given date ovrride: " + dateOverride + ", " + err.Error())
+		}
+	} else {
+		t1 = time.Now()
+	}
 
-	// Set defined format for CUR manifest
+	t1First := time.Date(t1.Year(), t1.Month(), 1, 0, 0, 0, 0, time.Local)
+
+	t2 := t1First.AddDate(0, 1, 0)
+	t2First := time.Date(t2.Year(), t2.Month(), 1, 0, 0, 0, 0, time.Local)
+
+	curDate := fmt.Sprintf("%d%02d01-%d%02d01", t1First.Year(), t1First.Month(), t2First.Year(), t2First.Month())
 	manifest := reportPath + "/" + curDate + "/" + reportName + "-Manifest.json"
 
 	// Set or extend destPath
+	destPathDate := fmt.Sprintf("%d%02d", t1First.Year(), t1First.Month())
+	var destPathFull string
 	if len(destPath) < 1 {
-		destPath = "parquet-cur/" + start.Format("200601")
+		destPathFull = "parquet-cur/" + destPathDate
 	} else {
-		destPath += "/" + start.Format("200601")
+		destPathFull = destPath + "/" + destPathDate
 	}
 
 	// Init CUR Converter
-	cc := curconvert.NewCurConvert(sourceBucket, manifest, destBucket, destPath)
+	cc := curconvert.NewCurConvert(sourceBucket, manifest, destBucket, destPathFull)
+
+	// Check current months manifest exists
+	if err := cc.CheckCURExists(); err != nil {
+		if err.(awserr.Error).Code() != s3.ErrCodeNoSuchKey {
+			return nil, "", "", errors.New("Error fetching CUR Manifest: " + err.Error())
+		}
+		if t1.Day() > 3 {
+			return nil, "", "", errors.New("Error fetching CUR Manifest, NoSuchKey and too delayed: " + err.Error())
+		}
+		// Regress to processing last months CUR. Error is ErrCodeNoSuchKey and still early in the month
+		doLog(logger, "Reseting to previous months CUR for "+reportName)
+		t1First = t1First.AddDate(0, 0, -1)
+		t2First = t2First.AddDate(0, 0, -1)
+		curDate = fmt.Sprintf("%d%02d01-%d%02d01", t1First.Year(), t1First.Month(), t2First.Year(), t2First.Month())
+		destPathDate = fmt.Sprintf("%d%02d", t1First.Year(), t1First.Month())
+
+		manifest := reportPath + "/" + curDate + "/" + reportName + "-Manifest.json"
+		cc.SetSourceManifest(manifest)
+
+		if len(destPath) < 1 {
+			destPathFull = "parquet-cur/" + destPathDate
+		} else {
+			destPathFull = destPath + "/" + destPathDate
+		}
+		cc.SetDestPath(destPathFull)
+	}
+
 	// Convert CUR
 	if err := cc.ConvertCur(); err != nil {
-		return nil, "", errors.New("Could not convert CUR: " + err.Error())
+		return nil, "", "", errors.New("Could not convert CUR: " + err.Error())
 	}
 
 	cols, err := cc.GetCURColumns()
 	if err != nil {
-		return nil, "", errors.New("Could not obtain CUR columns: " + err.Error())
+		return nil, "", "", errors.New("Could not obtain CUR columns: " + err.Error())
 	}
-
-	return cols, "s3://" + destBucket + "/" + destPath + "/", nil
+	return cols, "s3://" + destBucket + "/" + destPathFull + "/", destPathDate, nil
 }
 
 func createAthenaTable(svcAthena *athena.Athena, dbName string, tablePrefix string, sql string, columns []curconvert.CurColumn, s3Path string, date string, region string, account string) error {
@@ -618,7 +664,6 @@ func createAthenaTable(svcAthena *athena.Athena, dbName string, tablePrefix stri
 	}
 	cols = cols[:strings.LastIndex(cols, ",")]
 	sql = substituteParams(sql, map[string]string{"**DBNAME**": dbName, "**PREFIX**": tablePrefix, "**DATE**": date, "**COLUMNS**": cols, "**S3**": s3Path})
-
 	if _, err := sendQuery(svcAthena, dbName, sql, region, account); err != nil {
 		return err
 	}
@@ -660,8 +705,8 @@ func main() {
 	}
 
 	// read in command line params
-	var configFile, key, secret, account, sourceBucket, destBucket, curReportName, curReportPath, curDestPath string
-	if err := getParams(&configFile, &sourceBucket, &destBucket, &account, &curReportName, &curReportPath, &curDestPath); err != nil {
+	var configFile, account, sourceBucket, destBucket, curReportName, curReportPath, curDestPath, dateOverride string
+	if err := getParams(&configFile, &sourceBucket, &destBucket, &account, &curReportName, &curReportPath, &curDestPath, &dateOverride); err != nil {
 		doLog(logger, err.Error())
 		return
 	}
@@ -673,7 +718,7 @@ func main() {
 	}
 
 	// convert CUR
-	columns, s3Path, err := processCUR(sourceBucket, curReportName, curReportPath, curDestPath, destBucket)
+	columns, s3Path, curDate, err := processCUR(sourceBucket, curReportName, curReportPath, curDestPath, destBucket, logger, dateOverride)
 	if err != nil {
 		doLog(logger, err.Error())
 	}
@@ -687,18 +732,17 @@ func main() {
 		doLog(logger, "Could not create Athena Database: "+err.Error())
 	}
 
-	date := time.Now().Format("200601")
 	// make sure current Athena table exists
-	if err := createAthenaTable(svcAthena, conf.Athena.DbName, conf.Athena.TablePrefix, conf.Athena.TableSQL, columns, s3Path, date, meta["region"].(string), account); err != nil {
+	if err := createAthenaTable(svcAthena, conf.Athena.DbName, conf.Athena.TablePrefix, conf.Athena.TableSQL, columns, s3Path, curDate, meta["region"].(string), account); err != nil {
 		doLog(logger, "Could not create Athena Table: "+err.Error())
 	}
 
-	// If RI analysis enabled - do it
-	if conf.RI.Enabled {
-		if err := riUtilization(sess, svcAthena, conf, key, secret, meta["region"].(string), account, date); err != nil {
-			doLog(logger, err.Error())
-		}
-	}
+	// // If RI analysis enabled - do it
+	// if conf.RI.Enabled {
+	// 	if err := riUtilization(sess, svcAthena, conf, key, secret, meta["region"].(string), account, date); err != nil {
+	// 		doLog(logger, err.Error())
+	// 	}
+	// }
 
 	// struct for a query job
 	type job struct {
@@ -724,7 +768,7 @@ func main() {
 					return
 				}
 
-				sql := substituteParams(j.metric.SQL, map[string]string{"**DBNAME**": conf.Athena.DbName, "**DATE**": date, "**INTERVAL**": conf.MetricConfig.Substring[j.interval]})
+				sql := substituteParams(j.metric.SQL, map[string]string{"**DBNAME**": conf.Athena.DbName, "**DATE**": curDate, "**INTERVAL**": conf.MetricConfig.Substring[j.interval]})
 				results, err := sendQuery(j.svc, j.db, sql, j.region, j.account)
 				if err != nil {
 					doLog(logger, "Error querying Athena, SQL: "+sql+" , Error: "+err.Error())

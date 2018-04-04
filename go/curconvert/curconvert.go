@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -18,7 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/xitongsys/parquet-go/ParquetFile"
-	"github.com/xitongsys/parquet-go/Plugin/CSVWriter"
+	"github.com/xitongsys/parquet-go/ParquetWriter"
+	"github.com/xitongsys/parquet-go/SchemaHandler"
 )
 
 //
@@ -43,8 +45,9 @@ type CurConvert struct {
 	tempDir     string
 	concurrency int
 
-	CurColumns     []CSVWriter.MetadataType
+	CurColumns     []string
 	CurFiles       []string
+	CurParqetFiles map[string]bool
 	CurColumnTypes map[string]string
 	skipCols       map[int]bool
 }
@@ -77,6 +80,9 @@ func NewCurConvert(sBucket string, sObject string, dBucket string, dObject strin
 	cur.CurColumnTypes["reservation/totalreservedunits"] = "DOUBLE"
 	cur.CurColumnTypes["reservation/unitsperreservation"] = "DOUBLE"
 
+	// init parquet file map
+	cur.CurParqetFiles = make(map[string]bool)
+
 	return cur
 }
 
@@ -103,21 +109,55 @@ func (c *CurConvert) SetDestRole(arn string, externalID string) error {
 }
 
 //
+// SetCURManifest - configures the source manifest object for retrieving CUR from different AWS account
+func (c *CurConvert) SetSourceManifest(manifest string) error {
+	if len(manifest) < 1 {
+		return errors.New("Must supply a Manifest")
+	}
+	c.sourceObject = manifest
+	return nil
+}
+
+//
+// SetDestPath - configures the dest pat for the converted CUR
+func (c *CurConvert) SetDestPath(path string) error {
+	if len(path) < 1 {
+		return errors.New("Must supply a Path")
+	}
+	c.destObject = path
+	return nil
+}
+
+//
 // GetCURColumns - Converts processed CUR columns into map and returns it
 func (c *CurConvert) GetCURColumns() ([]CurColumn, error) {
 
-	if c.CurColumns == nil || len(c.CurColumns) < 1 {
-		return nil, errors.New("cannot fetch CUR column data, call ParseCUR first")
+	if len(c.CurColumns) < 1 {
+		return nil, errors.New("Cannot fetch CUR column data, call ParseCUR first")
 	}
 
+	sh := SchemaHandler.NewSchemaHandlerFromMetadata(c.CurColumns)
 	cols := []CurColumn{}
-	for i := 0; i < len(c.CurColumns); i++ {
-		if c.CurColumns[i].Type == "UTF8" {
-			c.CurColumns[i].Type = "STRING"
-		}
-		cols = append(cols, CurColumn{Name: c.CurColumns[i].Name, Type: c.CurColumns[i].Type})
-	}
 
+	for i := range sh.SchemaElements {
+		if sh.SchemaElements[i].Type == nil {
+			continue
+		}
+
+		var t string
+		if sh.SchemaElements[i].ConvertedType != nil {
+			t = sh.SchemaElements[i].ConvertedType.String()
+		} else if sh.SchemaElements[i].Type != nil {
+			t = sh.SchemaElements[i].Type.String()
+		} else {
+			return nil, errors.New("Cannot fetch CUR column data, Failed to find Type for CurColumn")
+		}
+
+		if t == "UTF8" {
+			t = "STRING"
+		}
+		cols = append(cols, CurColumn{Name: sh.SchemaElements[i].GetName(), Type: t})
+	}
 	return cols, nil
 }
 
@@ -208,6 +248,37 @@ func (c *CurConvert) initS3Uploader(bucket string, arn string, externalID string
 }
 
 //
+// CheckCURExists - Attempts to fetch manifest file to confirm existence of CUR
+func (c *CurConvert) CheckCURExists() error {
+
+	// get location of bucket
+	bucketLocation, err := c.getBucketLocation(c.sourceBucket, c.sourceArn, c.sourceExternalID)
+	if err != nil {
+		return err
+	}
+
+	// Init Session
+	sess, err := session.NewSession(&aws.Config{Region: aws.String(bucketLocation), DisableRestProtocolURICleaning: aws.Bool(true)})
+	if err != nil {
+		return err
+	}
+
+	// if needed set creds for AssumeRole and reset session
+	if len(c.sourceArn) > 0 {
+		sess = sess.Copy(&aws.Config{Credentials: c.getCreds(c.sourceArn, c.sourceExternalID, sess)})
+	}
+
+	svc := s3.New(sess)
+	_, err = svc.GetObject(
+		&s3.GetObjectInput{
+			Bucket: aws.String(c.sourceBucket),
+			Key:    aws.String(c.sourceObject),
+		})
+
+	return err
+}
+
+//
 // ParseCur - Reads JSON manifest file from S3 and adds needed data into struct
 func (c *CurConvert) ParseCur() error {
 
@@ -224,14 +295,14 @@ func (c *CurConvert) ParseCur() error {
 		Key:    aws.String(c.sourceObject),
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to download manifest, bucket: %s, object: %s, error: %s", c.sourceBucket, c.sourceObject, err.Error())
 	}
 
 	// Unmarshall JSON
 	var j map[string]interface{}
 	err = json.Unmarshal(buff.Bytes(), &j)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to parse manifest, bucket: %s, object: %s, error: %s", c.sourceBucket, c.sourceObject, err.Error())
 	}
 
 	// Store all column names from manifests
@@ -248,14 +319,14 @@ func (c *CurConvert) ParseCur() error {
 		columnName = strings.ToLower(columnName)
 		r := func(r rune) rune {
 			switch {
-				case r >= 'a' && r <= 'z':
-					return r
-				case r >= '0' && r <= '9':
-					return r
-				case r == '/':
-					return r
-				default: 
-					return '_'
+			case r >= 'a' && r <= 'z':
+				return r
+			case r >= '0' && r <= '9':
+				return r
+			case r == '/':
+				return r
+			default:
+				return '_'
 			}
 		}
 		columnName = strings.Map(r, columnName)
@@ -271,7 +342,7 @@ func (c *CurConvert) ParseCur() error {
 			colType = "UTF8"
 		}
 
-		c.CurColumns = append(c.CurColumns, CSVWriter.MetadataType{Type: colType, Name: columnName})
+		c.CurColumns = append(c.CurColumns, "name="+columnName+", type="+colType+", encoding=PLAIN_DICTIONARY")
 		seen[columnName] = true
 	}
 
@@ -311,7 +382,7 @@ func (c *CurConvert) DownloadCur(curObject string) (string, error) {
 		})
 
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to download CUR object, bucket: %s, object: %s, error: %s", c.sourceBucket, curObject, err.Error())
 	}
 
 	return localFile, nil
@@ -348,11 +419,11 @@ func (c *CurConvert) ParquetCur(inputFile string) (string, error) {
 	localParquetFile := c.tempDir + "/" + inputFile[strings.LastIndex(inputFile, "/")+1:strings.Index(inputFile, ".")] + ".parquet"
 	f, err := ParquetFile.NewLocalFileWriter(localParquetFile)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create parquet file %s, error: %s", localParquetFile, err.Error())
 	}
 
 	// init Parquet writer
-	ph, err := CSVWriter.NewCSVWriter(c.CurColumns, f, int64(c.concurrency))
+	ph, err := ParquetWriter.NewCSVWriter(c.CurColumns, f, int64(c.concurrency))
 	if err != nil {
 		return "", err
 	}
@@ -374,7 +445,7 @@ func (c *CurConvert) ParquetCur(inputFile string) (string, error) {
 		}
 
 		var recParquet []*string
-		for k, _ := range rec {
+		for k := range rec {
 			_, skip := c.skipCols[k]
 			if !skip {
 				recParquet = append(recParquet, &rec[k])
@@ -384,7 +455,9 @@ func (c *CurConvert) ParquetCur(inputFile string) (string, error) {
 		i++
 	}
 
-	ph.Flush(true)
+	if i > 1 {
+		ph.Flush(true)
+	}
 	ph.WriteStop()
 	f.Close()
 
@@ -418,9 +491,56 @@ func (c *CurConvert) UploadCur(parquetFile string) error {
 	})
 
 	if err != nil {
+		return fmt.Errorf("failed to upload CUR parquet object, bucket: %s, object: %s, error: %s", c.destBucket, uploadFile, err.Error())
+	}
+
+	c.CurParqetFiles[uploadFile] = true
+	return nil
+}
+
+//
+// CleanCUr
+func (c *CurConvert) CleanCur() error {
+
+	// init S3 manager
+	s3up, err := c.initS3Uploader(c.destBucket, c.destArn, c.destExternalID)
+	if err != nil {
 		return err
 	}
 
+	// List all objects in current parquet destination path
+	result, err := s3up.S3.ListObjectsV2(
+		&s3.ListObjectsV2Input{
+			Bucket:  aws.String(c.destBucket),
+			Prefix:  aws.String(c.destObject + "/"),
+			MaxKeys: aws.Int64(500),
+		})
+	if err != nil {
+		return fmt.Errorf("Error listing oject list when cleaning CUR: %s", err.Error())
+	}
+
+	// Build delete list of all objects not in c.CurParqetFiles map i.e. have not been uploaded on this conversion.
+	var deleteObjects []s3manager.BatchDeleteObject
+	for object := range result.Contents {
+		_, ok := c.CurParqetFiles[*result.Contents[object].Key]
+		if !ok {
+			deleteObjects = append(deleteObjects, s3manager.BatchDeleteObject{
+				Object: &s3.DeleteObjectInput{
+					Key:    aws.String(*result.Contents[object].Key),
+					Bucket: aws.String(c.destBucket),
+				},
+			})
+		}
+	}
+
+	// Proccess object delection / cleanup
+	batcher := s3manager.NewBatchDeleteWithClient(s3up.S3)
+	err = batcher.Delete(aws.BackgroundContext(), &s3manager.DeleteObjectsIterator{
+		Objects: deleteObjects,
+	})
+	if err != nil {
+		return fmt.Errorf("Error deleting objects when cleaning CUR: %s", err.Error())
+	}
 	return nil
 }
 
@@ -429,7 +549,7 @@ func (c *CurConvert) UploadCur(parquetFile string) error {
 func (c *CurConvert) ConvertCur() error {
 
 	if err := c.ParseCur(); err != nil {
-		return err
+		return fmt.Errorf("Error Parsing CUR Manifest: %s", err.Error())
 	}
 
 	result := make(chan error)
@@ -438,18 +558,18 @@ func (c *CurConvert) ConvertCur() error {
 		go func(object string) {
 			gzipFile, err := c.DownloadCur(object)
 			if err != nil {
-				result <- err
+				result <- fmt.Errorf("Error Downloading CUR: %s", err.Error())
 				return
 			}
 
 			parquetFile, err := c.ParquetCur(gzipFile)
 			if err != nil {
-				result <- err
+				result <- fmt.Errorf("Error Converting CUR: %s", err.Error())
 				return
 			}
 
 			if err := c.UploadCur(parquetFile); err != nil {
-				result <- err
+				result <- fmt.Errorf("Error Uploading CUR: %s", err.Error())
 				return
 			}
 
@@ -468,5 +588,5 @@ func (c *CurConvert) ConvertCur() error {
 		}
 	}
 
-	return nil
+	return c.CleanCur()
 }
